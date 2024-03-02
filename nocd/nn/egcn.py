@@ -1,5 +1,9 @@
-"""Torch modules for graph attention networks(GAT)."""
-# pylint: disable= no-member, arguments-differ, invalid-name
+import numpy as np
+import scipy.sparse as sp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 import torch as th
 from torch import nn
 
@@ -9,7 +13,20 @@ from dgl.base import DGLError
 from dgl.utils import expand_as_pair
 from dgl.nn.functional import edge_softmax
 
-# pylint: enable=W0235
+from nocd.utils import to_sparse_tensor
+
+__all__ = [
+    'EGCN',
+    'EdgeGATConv',
+]
+
+
+def sparse_or_dense_dropout(x, p=0.5, training=True):
+    if isinstance(x, (torch.sparse.FloatTensor, torch.cuda.sparse.FloatTensor)):
+        new_values = F.dropout(x.values(), p=p, training=training)
+        return torch.cuda.sparse.FloatTensor(x.indices(), new_values, x.size())
+    else:
+        return F.dropout(x, p=p, training=training)
 
 
 class EdgeGATConv(nn.Module):
@@ -394,3 +411,87 @@ class EdgeGATConv(nn.Module):
                 return rst, graph.edata["a"]
             else:
                 return rst
+
+
+
+class EGCN(nn.Module):
+    """Graph convolution network.
+
+    References:
+        "Semi-superivsed learning with graph convolutional networks",
+        Kipf and Welling, ICLR 2017
+    """
+    def __init__(
+        self,
+        in_feats,
+        edge_feats,
+        hidden_feats,
+        out_feats,
+        num_heads,
+        feat_drop=0.0,
+        attn_drop=0.0,
+        negative_slope=0.2,
+        residual=True,
+        activation=None,
+        allow_zero_in_degree=False,
+        bias=True,
+        dropout=0.5, 
+        batch_norm=False,
+        ):
+        super().__init__()
+        self.dropout = dropout
+        layer_dims = np.concatenate([hidden_feats, [out_feats]]).astype(np.int32)
+        self.layers = nn.ModuleList([EdgeGATConv(in_feats,
+                                                 edge_feats, 
+                                                 layer_dims[0], 
+                                                 num_heads,
+                                                 feat_drop,
+                                                 attn_drop,
+                                                 negative_slope,
+                                                 residual,
+                                                 activation,
+                                                 allow_zero_in_degree,
+                                                 bias)])
+        for idx in range(len(layer_dims) - 1):
+            self.layers.append(EdgeGATConv(layer_dims[idx], edge_feats, layer_dims[idx + 1],num_heads,feat_drop,attn_drop,negative_slope,residual,activation,allow_zero_in_degree,bias))
+        if batch_norm:
+            self.batch_norm = [
+                nn.BatchNorm1d(dim, affine=False, track_running_stats=False) for dim in hidden_feats
+            ]
+        else:
+            self.batch_norm = None
+
+    @staticmethod
+    def normalize_adj(adj : sp.csr_matrix):
+        """Normalize adjacency matrix and convert it to a sparse tensor."""
+        if sp.isspmatrix(adj):
+            adj = adj.tolil()
+            adj.setdiag(1)
+            adj = adj.tocsr()
+            deg = np.ravel(adj.sum(1))
+            deg_sqrt_inv = 1 / np.sqrt(deg)
+            adj_norm = adj.multiply(deg_sqrt_inv[:, None]).multiply(deg_sqrt_inv[None, :])
+        elif torch.is_tensor(adj):
+            deg = adj.sum(1)
+            deg_sqrt_inv = 1 / torch.sqrt(deg)
+            adj_norm = adj * deg_sqrt_inv[:, None] * deg_sqrt_inv[None, :]
+        return to_sparse_tensor(adj_norm)
+
+    def forward(self, graph, feat, edge_feat, get_attention=False):
+        for idx, egcn in enumerate(self.layers):
+            if self.dropout != 0:
+                feat = sparse_or_dense_dropout(feat, p=self.dropout, training=self.training)
+            feat = egcn(graph, feat, edge_feat, get_attention)
+            if idx != len(self.layers) - 1:
+                feat = F.relu(feat)
+                if self.batch_norm is not None:
+                    feat = self.batch_norm[idx](feat)
+        return feat
+
+    def get_weights(self):
+        """Return the weight matrices of the model."""
+        return [w for n, w in self.named_parameters() if 'bias' not in n]
+
+    def get_biases(self):
+        """Return the bias vectors of the model."""
+        return [w for n, w in self.named_parameters() if 'bias' in n]
